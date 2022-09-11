@@ -1,7 +1,9 @@
 import socket
+import sys
 import threading
 import struct
 import time
+import zlib
 
 
 class SimpleTcpClient:
@@ -100,7 +102,8 @@ class AgwpePacket:
             'call_from ' + repr(self.call_from),
             'call_to ' + repr(self.call_to),
             'data_len ' + repr(self.data_len),
-            'data ' + repr(self.data),
+            'data' + repr(self.data),
+            'data ' + ' '.join([hex(ch) for ch in self.data]),
         ])
 
     def set_kind(self, kind: str):
@@ -168,12 +171,17 @@ class AgwpePacket:
         return p
 
 
+# Just to make sure all AgwpeClients call the events one-by-one
+AgwpeClientMutex = threading.Lock()
+
+
 class AgwpeClient:
     def __init__(self):
         self.tcp_client = SimpleTcpClient()
 
         self.on_version_info = []
         self.on_unknown_packet = []
+        self.on_raw_packet = []
 
     def connect(self, host: str, port: int):
         self.tcp_client.on_data.append(self._handle_data)
@@ -190,19 +198,22 @@ class AgwpeClient:
 
     def _handle_data(self, data: bytes):
         try:
+            AgwpeClientMutex.acquire()
             packet = AgwpePacket.decode(data)
 
             if packet.kind == b'R':  # version response
                 (major, minor) = struct.unpack('HxxHxx', packet.data)  # this is wrong, or at least weird? 2005 127 ?
                 self._trigger_event(self.on_version_info, major, minor)
+            if packet.kind == b'K':
+                self._trigger_event(self.on_raw_packet, packet.data[1:])  # first byte is port number (so ignore)
             else:
-                print(packet)
                 self._trigger_event(self.on_unknown_packet, packet)
 
         except Exception as e:
             print("Unable to decode packet")
             print(e)
-            print(repr(data))
+        finally:
+            AgwpeClientMutex.release()
 
     def request_version_info(self):
         packet = AgwpePacket()
@@ -233,52 +244,79 @@ class AgwpeClient:
         packet.set_data(data)
         self.tcp_client.send(packet.encode())
 
+    def send_raw_packet(self, data: bytes):
+        packet = AgwpePacket()
+        packet.set_kind('K')
+        packet.set_data(data)
+        self.tcp_client.send(packet.encode())
+        pass
 
-def print_version(major, minor):
+
+def encode_pacpal_message(data: bytes):
+    magic = b'PACPAL'
+    version = b'\x01'
+    length = struct.pack('B', len(data))
+    crc32 = struct.pack('I', zlib.crc32(data) & 0xffffffff)
+    return b' ' + magic + version + length + crc32 + data  # Don't ask me what the space is for...
+
+
+def decode_pacpal_message(data: bytes):
+    if data[0:6] != b'PACPAL':
+        raise Exception('Magic Header missing')
+    if data[6] == b'\x01':
+        raise Exception('Wrong version found')
+    length = data[7]
+    sent_crc32 = struct.unpack('I', data[8:12])[0]
+    data = data[12:]
+    calculated_crc32 = zlib.crc32(data) & 0xffffffff
+    if sent_crc32 != calculated_crc32:
+        raise Exception('Bit error crc32 does not match')
+    return data
+
+
+def handle_version(major, minor):
     print("Version", major, minor)
 
 
-# SoundModem_HS 1
-client1 = AgwpeClient()
-client1.connect('localhost', 8000)
-client1.on_version_info.append(print_version)
-client1.request_version_info()
-# client1.enable_raw_monitoring()
-
-# SoundModem_HS 2
-client2 = AgwpeClient()
-client2.connect('localhost', 9000)
-client2.on_version_info.append(print_version)
-client2.enable_monitoring()
-client2.enable_raw_monitoring()
-client2.request_version_info()
-# client2.register_callsign('VK3ARD')
-
-time.sleep(1)
-
-# Oh no.  The 'T' frames from monitored are missing unprintable bytes.  They are sent, but stripped.
-# Spec says:  "containing the sent data in a fully transparent way (binary information,
-#              no delimiters, bit stuffing or escape codes)"
-#
-# They are missing from 'U' frames too...
-#
-# Thankfully, the raw data 'K' frames have the binary data... But I now need to parse AX.25 headers too ugh
+def handle_raw_packet(data: bytes):
+    try:
+        # Try and decode to see if it's a pacpal message
+        msg = decode_pacpal_message(data)
+        print('Received data', msg.hex(' ', 1))
+    except Exception as e:
+        print('Got raw packet, but failed to decode', e)
 
 
-# But now I'm not getting U or K frames!?  WTF it was working before
-# OMG, don't transmit from client1 and client2 at the same time and expect things to work!?
-client1.send_unproto('CL1', 'PACPAL', b'Hello World 1 from 8000 \x00\x01\x02\x03\x04\x05\x06\x07 Where are my bytes!?')
-client1.send_unproto('CL1', 'PACPAL', b'Hello World 2 from 8000 \x00\x01\x02\x03\x04\x05\x06\x07 Where are my bytes!?')
-client1.send_unproto('CL1', 'PACPAL', b'Hello World 3 from 8000 \x00\x01\x02\x03\x04\x05\x06\x07 Where are my bytes!?')
+if __name__ == '__main__':
 
-time.sleep(1)
+    client1 = AgwpeClient()
+    client2 = AgwpeClient()
 
-client2.send_unproto('CL2', 'PACPAL', b'Hello World 1 from 9000 \x00\x01\x02\x03\x04\x05\x06\x07 Where are my bytes!?')
-client2.send_unproto('CL2', 'PACPAL', b'Hello World 2 from 9000 \x00\x01\x02\x03\x04\x05\x06\x07 Where are my bytes!?')
-client2.send_unproto('CL2', 'PACPAL', b'Hello World 3 from 9000 \x00\x01\x02\x03\x04\x05\x06\x07 Where are my bytes!?')
+    try:
+        # SoundModem_HS 1
+        client1.connect('localhost', 8000)
 
-time.sleep(1)
+        client1.enable_raw_monitoring()
+        client1.on_raw_packet.append(handle_raw_packet)
 
-client1.disconnect()
-client2.disconnect()
+        # SoundModem_HS 2
+        client2.connect('localhost', 9000)
+
+        time.sleep(0.5)
+
+        messages_to_send = [
+            b'\x01\x02\x03\x04\x05\x06\x07',
+            b'\x08\x09\x0A\x0B\x0C\x0D\x0E',
+            b'\x0F\x10\x11\x12\x13\x14\x15'
+        ]
+
+        for msg in messages_to_send:
+            print('Client 2 sending:', msg.hex(' ', 1))
+            client2.send_raw_packet(encode_pacpal_message(msg))
+
+        time.sleep(0.5)
+
+    finally:
+        client1.disconnect()
+        client2.disconnect()
 
