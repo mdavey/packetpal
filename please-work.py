@@ -302,6 +302,42 @@ def decode_pacpal_message(data: bytes):
     return data
 
 
+def transfer_data(host: str, port: int, callsign: bytes, data: bytes):
+    chuck_size = 256-22
+    buffer_size = 4
+
+    agwpe = AgwpeClient()
+    agwpe.connect(host, port)
+
+    outstanding_frames = 0
+
+    def update_outstanding_frames(new: int):
+        nonlocal outstanding_frames
+        outstanding_frames = new
+
+    agwpe.on_outstanding_frames.append(update_outstanding_frames)
+
+    for offset in range(0, len(data), chuck_size):
+        print('offset', offset, 'len', len(data))
+        if len(data) > offset+chuck_size:
+            d = data[offset:offset+chuck_size]
+        else:
+            d = data[offset:]
+
+        print(d.hex(' ', 1))
+
+        while outstanding_frames > buffer_size:
+            print('Waiting for buffer to empty, current outstanding frames:', outstanding_frames)
+            agwpe.request_outstanding_frames()
+            time.sleep(0.1)
+
+        agwpe.send_raw_packet(encode_pacpal_message(callsign, d))
+        agwpe.request_outstanding_frames()
+        time.sleep(0.1)
+
+    agwpe.disconnect()
+
+
 def handle_version(major, minor):
     print("Version", major, minor)
 
@@ -320,60 +356,77 @@ def handle_outstanding_frames(outstanding_frames: int):
 
 
 if __name__ == '__main__':
-
-    client1 = AgwpeClient()
-    client2 = AgwpeClient()
+    recv_client = AgwpeClient()
 
     try:
-        # SoundModem_HS 1
-        client1.connect('localhost', 8000)
+        recv_client.connect('localhost', 8000)
+        recv_client.enable_raw_monitoring()
+        recv_client.on_raw_packet.append(handle_raw_packet)
 
-        client1.enable_raw_monitoring()
-        client1.on_raw_packet.append(handle_raw_packet)
+        data = b'\x00\x01\x02\x03\x04\x05\x06\x07'
+        transfer_data('localhost', 9000, b'VK3ARD', data * 1024)
 
-        # SoundModem_HS 2
-        client2.connect('localhost', 9000)
-        client2.on_outstanding_frames.append(handle_outstanding_frames)
-        client2.request_port_info()
-        client2.request_port_capabilities()
-        # client2.enable_monitoring()
-
-        time.sleep(0.5)
-
-        messages_to_send = [
-            b'\x01\x02\x03\x04\x05\x06\x07',
-            b'\x08\x09\x0A\x0B\x0C\x0D\x0E',
-            b'\x0F\x10\x11\x12\x13\x14\x15'
-        ]
-
-        for x in range(1, 8):
-            for msg in messages_to_send:
-                print('Client 2 sending:', msg.hex(' ', 1))
-                client2.send_raw_packet(encode_pacpal_message(b'VK3ARD', msg * 8))
-
-        for x in range(1, 32):
-            # This just always returns '0'
-            # Was this all a giant waste of time?
-            # I need to know how much data is waiting to be sent.
-            # QTSoundModem just ignores it completely
-            #
-            # I don't know what I can do except for listening to the audio device itself to tell when data has been
-            # transmitted... Which is insane, and still doesn't get what I want.
-            #
-            # How the hell does everyone else manage flow control?
-            #
-            # Does everyone just ignore it?
-            #
-            # Answer:
-            # Direwolf support the 'y' frame but only for *real* AX.25 packets
-            # I've built my own version of 1.7.0 with a single change:
-            # tq.c:987 [-]      if (ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
-            # tq.c:987 [+]      if (TRUE || ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
-            #
-            # Probably not a good idea, but it looks like it works, and I can now do flow control for raw frames
-            client2.request_outstanding_frames()
-            time.sleep(0.5)
-
+        time.sleep(2)
     finally:
-        client1.disconnect()
-        client2.disconnect()
+        recv_client.disconnect()
+
+
+# if __name__ == '__main__':
+#
+#     client1 = AgwpeClient()
+#     client2 = AgwpeClient()
+#
+#     try:
+#         # SoundModem_HS 1
+#         client1.connect('localhost', 8000)
+#
+#         client1.enable_raw_monitoring()
+#         client1.on_raw_packet.append(handle_raw_packet)
+#
+#         # SoundModem_HS 2
+#         client2.connect('localhost', 9000)
+#         client2.on_outstanding_frames.append(handle_outstanding_frames)
+#         client2.request_port_info()
+#         client2.request_port_capabilities()
+#         # client2.enable_monitoring()
+#
+#         time.sleep(0.5)
+#
+#         messages_to_send = [
+#             b'\x01\x02\x03\x04\x05\x06\x07',
+#             b'\x08\x09\x0A\x0B\x0C\x0D\x0E',
+#             b'\x0F\x10\x11\x12\x13\x14\x15'
+#         ]
+#
+#         for x in range(1, 8):
+#             for msg in messages_to_send:
+#                 print('Client 2 sending:', msg.hex(' ', 1))
+#                 client2.send_raw_packet(encode_pacpal_message(b'VK3ARD', msg * 8))
+#
+#         for x in range(1, 32):
+#             # This just always returns '0'
+#             # Was this all a giant waste of time?
+#             # I need to know how much data is waiting to be sent.
+#             # QTSoundModem just ignores it completely
+#             #
+#             # I don't know what I can do except for listening to the audio device itself to tell when data has been
+#             # transmitted... Which is insane, and still doesn't get what I want.
+#             #
+#             # How the hell does everyone else manage flow control?
+#             #
+#             # Does everyone just ignore it?
+#             #
+#             # Answer:
+#             # Direwolf support the 'y' frame but only for *real* AX.25 packets
+#             # I've built my own version of 1.7.0 with a single change:
+#             # tq.c:987 [-]      if (ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
+#             # tq.c:987 [+]      if (TRUE || ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
+#             #
+#             # Probably not a good idea, but it looks like it works, and I can now do flow control for raw frames
+#             client2.request_outstanding_frames()
+#             time.sleep(0.5)
+#
+#     finally:
+#         client1.disconnect()
+#         client2.disconnect()
+#
