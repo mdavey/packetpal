@@ -14,6 +14,10 @@ class SimpleTcpClient:
     frames...  I'm not looking forward to that, it seems really complicated (how do I tell the difference between an
     incomplete header, and corrupted data?  How long do I wait for the rest of the data?).
 
+    Aha, steal this too:
+    https://github.com/HenkVanAsselt/pyagw/blob/master/src/agwpe.py#L156
+
+
     multiple event handlers for incoming data by:
     def i_got_data(bytes):
         print(repr(bytes))
@@ -101,6 +105,7 @@ class AgwpePacket:
             'kind ' + repr(self.kind),
             'call_from ' + repr(self.call_from),
             'call_to ' + repr(self.call_to),
+            'user' + repr(self.user),
             'data_len ' + repr(self.data_len),
             'data' + repr(self.data),
             'data ' + ' '.join([hex(ch) for ch in self.data]),
@@ -151,7 +156,7 @@ class AgwpePacket:
         Um, what happens when it cannot decode?
         """
         data_len = len(raw) - 36
-        parts = struct.unpack("BBBBcBBB10s10sII" + str(data_len)+"s", raw)
+        parts = struct.unpack("BBBBcBBB10s10sI4s" + str(data_len)+"s", raw)
 
         p = AgwpePacket()
         p.port = parts[0]
@@ -182,6 +187,7 @@ class AgwpeClient:
         self.on_version_info = []
         self.on_unknown_packet = []
         self.on_raw_packet = []
+        self.on_outstanding_frames = []
 
     def connect(self, host: str, port: int):
         self.tcp_client.on_data.append(self._handle_data)
@@ -204,9 +210,12 @@ class AgwpeClient:
             if packet.kind == b'R':  # version response
                 (major, minor) = struct.unpack('HxxHxx', packet.data)  # this is wrong, or at least weird? 2005 127 ?
                 self._trigger_event(self.on_version_info, major, minor)
-            if packet.kind == b'K':
+            elif packet.kind == b'K':
                 self._trigger_event(self.on_raw_packet, packet.data[1:])  # first byte is port number (so ignore)
+            elif packet.kind == b'y':
+                self._trigger_event(self.on_outstanding_frames, struct.unpack('I', packet.data)[0])
             else:
+                print(packet)
                 self._trigger_event(self.on_unknown_packet, packet)
 
         except Exception as e:
@@ -214,10 +223,26 @@ class AgwpeClient:
             print(e)
         finally:
             AgwpeClientMutex.release()
+            pass
 
     def request_version_info(self):
         packet = AgwpePacket()
         packet.set_kind('R')
+        self.tcp_client.send(packet.encode())
+
+    def request_port_info(self):
+        packet = AgwpePacket()
+        packet.set_kind('G')
+        self.tcp_client.send(packet.encode())
+
+    def request_port_capabilities(self):
+        packet = AgwpePacket()
+        packet.set_kind('g')
+        self.tcp_client.send(packet.encode())
+
+    def request_outstanding_frames(self):
+        packet = AgwpePacket()
+        packet.set_kind('y')
         self.tcp_client.send(packet.encode())
 
     def register_callsign(self, callsign):
@@ -249,15 +274,17 @@ class AgwpeClient:
         packet.set_kind('K')
         packet.set_data(data)
         self.tcp_client.send(packet.encode())
-        pass
 
 
-def encode_pacpal_message(data: bytes):
+def encode_pacpal_message(callsign: bytes, data: bytes):
+    if len(callsign) >= 10:
+        raise Exception('Callsign must be 10 or less bytes')
     magic = b'PACPAL'
     version = b'\x01'
+    callsign_padded = callsign + (b"\x00" * (10-len(callsign)))
     length = struct.pack('B', len(data))
     crc32 = struct.pack('I', zlib.crc32(data) & 0xffffffff)
-    return b' ' + magic + version + length + crc32 + data  # Don't ask me what the space is for...
+    return b'\x00' + magic + version + callsign_padded + length + crc32 + data  # 0x00 is for port 0 (for some reason...)
 
 
 def decode_pacpal_message(data: bytes):
@@ -265,9 +292,10 @@ def decode_pacpal_message(data: bytes):
         raise Exception('Magic Header missing')
     if data[6] == b'\x01':
         raise Exception('Wrong version found')
-    length = data[7]
-    sent_crc32 = struct.unpack('I', data[8:12])[0]
-    data = data[12:]
+    callsign = data[7:17]
+    length = data[17]
+    sent_crc32 = struct.unpack('I', data[18:22])[0]
+    data = data[22:]
     calculated_crc32 = zlib.crc32(data) & 0xffffffff
     if sent_crc32 != calculated_crc32:
         raise Exception('Bit error crc32 does not match')
@@ -287,6 +315,10 @@ def handle_raw_packet(data: bytes):
         print('Got raw packet, but failed to decode', e)
 
 
+def handle_outstanding_frames(outstanding_frames: int):
+    print('Outstanding frames:', outstanding_frames)
+
+
 if __name__ == '__main__':
 
     client1 = AgwpeClient()
@@ -301,6 +333,10 @@ if __name__ == '__main__':
 
         # SoundModem_HS 2
         client2.connect('localhost', 9000)
+        client2.on_outstanding_frames.append(handle_outstanding_frames)
+        client2.request_port_info()
+        client2.request_port_capabilities()
+        # client2.enable_monitoring()
 
         time.sleep(0.5)
 
@@ -310,13 +346,34 @@ if __name__ == '__main__':
             b'\x0F\x10\x11\x12\x13\x14\x15'
         ]
 
-        for msg in messages_to_send:
-            print('Client 2 sending:', msg.hex(' ', 1))
-            client2.send_raw_packet(encode_pacpal_message(msg))
+        for x in range(1, 8):
+            for msg in messages_to_send:
+                print('Client 2 sending:', msg.hex(' ', 1))
+                client2.send_raw_packet(encode_pacpal_message(b'VK3ARD', msg * 8))
 
-        time.sleep(0.5)
+        for x in range(1, 32):
+            # This just always returns '0'
+            # Was this all a giant waste of time?
+            # I need to know how much data is waiting to be sent.
+            # QTSoundModem just ignores it completely
+            #
+            # I don't know what I can do except for listening to the audio device itself to tell when data has been
+            # transmitted... Which is insane, and still doesn't get what I want.
+            #
+            # How the hell does everyone else manage flow control?
+            #
+            # Does everyone just ignore it?
+            #
+            # Answer:
+            # Direwolf support the 'y' frame but only for *real* AX.25 packets
+            # I've built my own version of 1.7.0 with a single change:
+            # tq.c:987 [-]      if (ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
+            # tq.c:987 [+]      if (TRUE || ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
+            #
+            # Probably not a good idea, but it looks like it works, and I can now do flow control for raw frames
+            client2.request_outstanding_frames()
+            time.sleep(0.5)
 
     finally:
         client1.disconnect()
         client2.disconnect()
-
