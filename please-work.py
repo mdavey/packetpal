@@ -282,9 +282,9 @@ def encode_pacpal_message(callsign: bytes, data: bytes):
     magic = b'PACPAL'
     version = b'\x01'
     callsign_padded = callsign + (b"\x00" * (10-len(callsign)))
-    length = struct.pack('B', len(data))
     crc32 = struct.pack('I', zlib.crc32(data) & 0xffffffff)
-    return b'\x00' + magic + version + callsign_padded + length + crc32 + data  # 0x00 is for port 0 (for some reason...)
+    # 0x00 is for port 0 (for some reason...)
+    return b'\x00' + magic + version + callsign_padded + b'\x00' + crc32 + data
 
 
 def decode_pacpal_message(data: bytes):
@@ -293,7 +293,7 @@ def decode_pacpal_message(data: bytes):
     if data[6] == b'\x01':
         raise Exception('Wrong version found')
     callsign = data[7:17]
-    length = data[17]
+    reserved = data[17]
     sent_crc32 = struct.unpack('I', data[18:22])[0]
     data = data[22:]
     calculated_crc32 = zlib.crc32(data) & 0xffffffff
@@ -303,7 +303,9 @@ def decode_pacpal_message(data: bytes):
 
 
 def transfer_data(host: str, port: int, callsign: bytes, data: bytes):
-    chuck_size = 256-22
+    # chuck_size = 256-22
+    chuck_size = 512-22
+    # chuck_size = 1024-22
     buffer_size = 4
 
     agwpe = AgwpeClient()
@@ -318,16 +320,14 @@ def transfer_data(host: str, port: int, callsign: bytes, data: bytes):
     agwpe.on_outstanding_frames.append(update_outstanding_frames)
 
     for offset in range(0, len(data), chuck_size):
-        print('offset', offset, 'len', len(data))
+        # print('offset', offset, 'len', len(data))
         if len(data) > offset+chuck_size:
             d = data[offset:offset+chuck_size]
         else:
             d = data[offset:]
 
-        print(d.hex(' ', 1))
-
         while outstanding_frames > buffer_size:
-            print('Waiting for buffer to empty, current outstanding frames:', outstanding_frames)
+            # print('Waiting for buffer to empty, current outstanding frames:', outstanding_frames)
             agwpe.request_outstanding_frames()
             time.sleep(0.1)
 
@@ -342,18 +342,56 @@ def handle_version(major, minor):
     print("Version", major, minor)
 
 
+time_last_packet_received_msec = 0
+full_data = b''
+
+
 def handle_raw_packet(data: bytes):
     try:
         # Try and decode to see if it's a pacpal message
         msg = decode_pacpal_message(data)
-        print('Received data', msg.hex(' ', 1))
+        print('New data received with length', len(data), 'bytes')
+        global full_data
+        full_data += msg
+        current_crc32 = zlib.crc32(full_data) & 0xffffffff
+        print('Total data is length', len(full_data), 'bytes, and has a crc32 of', current_crc32)
+
+        global time_last_packet_received_msec
+        time_last_packet_received_msec = round(time.time() * 1000)
     except Exception as e:
         print('Got raw packet, but failed to decode', e)
 
 
-def handle_outstanding_frames(outstanding_frames: int):
-    print('Outstanding frames:', outstanding_frames)
+#   PACPAL     Magic
+#   VERSION    0x01
+#   CALLSIGN   10 bytes     Right padded with 0x00  (I think 7 is the longest, but people like SSID too so...)
+#   TRANSFER#  16bit int    One transfer, multiple files  (random number probably fine)
+#   FILE       8bit int     Which file are the blocks/data associated with.
+#                           0 = metadata about transfer (names, comments, etc)
+#   BLOCK      16bit int    Which block is the data for
+#   MAX_BLOCK  16bit int    How many blocks in total
+#                           This can't be in the metadata, because the metadata might be >1 block long
+#   CRC32      32bit int
+#   DATA       Bytes[]
 
+# 38 byte header, eww......  I think we actually need to make sure it's at 36 bytes anyway for Direwolf to consider
+# it a valid frame?
+
+
+# 256 byte packets
+# Msec taken 9149
+# Bytes transferred 8192
+# Speed 895.3984041971801 byte/s
+
+# 512 byte packets
+# Msec taken 7895
+# Bytes transferred 8192
+# Speed 1037.6187460417987 byte/s
+
+# 1024 byte packets
+# Msec taken 7841
+# Bytes transferred 8192
+# Speed 1044.7646983803086 byte/s
 
 if __name__ == '__main__':
     recv_client = AgwpeClient()
@@ -363,70 +401,19 @@ if __name__ == '__main__':
         recv_client.enable_raw_monitoring()
         recv_client.on_raw_packet.append(handle_raw_packet)
 
-        data = b'\x00\x01\x02\x03\x04\x05\x06\x07'
-        transfer_data('localhost', 9000, b'VK3ARD', data * 1024)
+        test_data = b'\x00\x01\x02\x03\x04\x05\x06\x07' * 1024
+        checksum = zlib.crc32(test_data) & 0xffffffff
+        print('Data sent is', len(test_data), 'bytes long, and has a crc32 of', checksum)
 
-        time.sleep(2)
+        time_start_msec = round(time.time() * 1000)
+        transfer_data('localhost', 9000, b'VK3ARD', test_data)
+
+        time.sleep(8)
+
+        transfer_time_msec = time_last_packet_received_msec - time_start_msec
+        print('Msec taken', transfer_time_msec)
+        print('Bytes transferred', len(full_data))
+        print('Speed', len(full_data) / (transfer_time_msec/1000), 'byte/s')
+
     finally:
         recv_client.disconnect()
-
-
-# if __name__ == '__main__':
-#
-#     client1 = AgwpeClient()
-#     client2 = AgwpeClient()
-#
-#     try:
-#         # SoundModem_HS 1
-#         client1.connect('localhost', 8000)
-#
-#         client1.enable_raw_monitoring()
-#         client1.on_raw_packet.append(handle_raw_packet)
-#
-#         # SoundModem_HS 2
-#         client2.connect('localhost', 9000)
-#         client2.on_outstanding_frames.append(handle_outstanding_frames)
-#         client2.request_port_info()
-#         client2.request_port_capabilities()
-#         # client2.enable_monitoring()
-#
-#         time.sleep(0.5)
-#
-#         messages_to_send = [
-#             b'\x01\x02\x03\x04\x05\x06\x07',
-#             b'\x08\x09\x0A\x0B\x0C\x0D\x0E',
-#             b'\x0F\x10\x11\x12\x13\x14\x15'
-#         ]
-#
-#         for x in range(1, 8):
-#             for msg in messages_to_send:
-#                 print('Client 2 sending:', msg.hex(' ', 1))
-#                 client2.send_raw_packet(encode_pacpal_message(b'VK3ARD', msg * 8))
-#
-#         for x in range(1, 32):
-#             # This just always returns '0'
-#             # Was this all a giant waste of time?
-#             # I need to know how much data is waiting to be sent.
-#             # QTSoundModem just ignores it completely
-#             #
-#             # I don't know what I can do except for listening to the audio device itself to tell when data has been
-#             # transmitted... Which is insane, and still doesn't get what I want.
-#             #
-#             # How the hell does everyone else manage flow control?
-#             #
-#             # Does everyone just ignore it?
-#             #
-#             # Answer:
-#             # Direwolf support the 'y' frame but only for *real* AX.25 packets
-#             # I've built my own version of 1.7.0 with a single change:
-#             # tq.c:987 [-]      if (ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
-#             # tq.c:987 [+]      if (TRUE || ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
-#             #
-#             # Probably not a good idea, but it looks like it works, and I can now do flow control for raw frames
-#             client2.request_outstanding_frames()
-#             time.sleep(0.5)
-#
-#     finally:
-#         client1.disconnect()
-#         client2.disconnect()
-#
