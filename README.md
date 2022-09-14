@@ -1,8 +1,40 @@
-# packetpal
+# PacketPal
 
-A Python experiment with packet modems using AGWPE
+A Python experiment with packet modems using AGWPE.
 
-I wouldn't use, even as a reference, right now.
+Maybe good enough to get an idea how to use AGWPE.
+
+## Requirements
+
+- Direwolf 1.7.0 with my patch to enable flow control from non AX.25 packets
+- Python 3.x
+
+### Direwolf 1.7.0 patch
+
+By default, when sending a 'y' AWGPE packet Direwolf only counts queues data that is a valid AX.25.  Because we're 
+sending raw packets, Direwolf always returns 0 packets queued.
+
+For testing I've modified line 987 of `src/tq.c`:
+
+```text
+    From: if (ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
+    
+    To:   if (TRUE || ax25_get_num_addr(pp) >= AX25_MIN_ADDRS) {
+```
+
+I'm sure it breaks the source and dest filtering.  For now, I'm just seeing if this entire idea will work, later on I 
+can talk to the Direwolf devs about it.
+
+## Usage
+
+For local testing, need one modem for receiving and one for sending.  For testing, I'm using SoundModem_HS by UZ7HO for 
+receiving and Direwolf for sending.
+
+Set the AGWPE ports in `test_recv.py` and `test_send.py`
+
+Run `test_recv.py` in one console, and `test_send.py` in another.
+
+When the data is all received, ctrl+c `test_recv.py` to see speed/etc 
 
 ## Notes
 
