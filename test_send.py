@@ -6,8 +6,8 @@ from pacpal_message import PacpalMessage
 
 def transfer_data(host: str, port: int, callsign: bytes, data: bytes):
     # chuck_size = 256-22
-    # chuck_size = 512-22
-    chuck_size = 1024-22
+    chuck_size = 512-22
+    # chuck_size = 1024-22
     buffer_size = 4
 
     agwpe = AgwpeClient()
